@@ -1,25 +1,21 @@
-name: 仙侠SLG舆情日报
+name: 仙侠SLG热点日报
 
 on:
+  workflow_dispatch:
   schedule:
-    # 每天 10:00 北京时间 = UTC 02:00
     - cron: '0 2 * * *'
-  workflow_dispatch:  # 手动触发，方便测试
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 打印目录结构（调试用）
-        run: find . -maxdepth 2 -type f | head -30
+      - name: 打印目录结构
+        run: find . -maxdepth 3 && echo "---" && pwd
 
       - name: 安装 Python
         uses: actions/setup-python@v5
@@ -27,32 +23,29 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: |
-          pip install requests pyyaml pytz
-          pip install -r requirements.txt 2>/dev/null || true
+        run: pip install requests pyyaml pytz beautifulsoup4 lxml
 
       - name: 运行 TrendRadar 数据采集
-        run: python main.py 2>&1
-
-      - name: 运行正文分析与报告生成
-        run: python post_process.py 2>&1
+        run: python3 main.py
         env:
           TZ: Asia/Shanghai
 
+      - name: 运行正文分析与报告生成
+        run: python3 post_process.py
+
       - name: 推送报告到 GitHub 仓库
-        if: github.event_name == 'schedule'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/$(date +'%Y年%m月%d日')/ -v 2>&1 || true
-          git diff --cached --quiet || (echo "No new output" && exit 0)
-          git commit -m "日报 $(date +'%Y-%m-%d %H:%M')" || true
-          git push 2>&1 || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if [ -d "output" ]; then
+            git config --local user.email "github-actions@github.com"
+            git config --local user.name "github-actions"
+            git add output/
+            git commit -m "Update report $(date '+%Y-%m-%d %H:%M')" || true
+            git push || echo "推送被跳过（无变更或无权限）"
+          else
+            echo "无 output 目录，跳过推送"
+          fi
 
       - name: 发送飞书通知
-        if: always()
         run: |
           python3 << 'EOF'
           import os, json, sys, re
@@ -62,32 +55,35 @@ jobs:
 
           WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
           if not WEBHOOK:
-            print("FEISHU_WEBHOOK 未设置，跳过推送")
-            sys.exit(0)
+              print("FEISHU_WEBHOOK 未设置，跳过推送")
+              sys.exit(0)
 
           tz = pytz.timezone('Asia/Shanghai')
-          today = datetime.now(tz).strftime('%Y-%m-%d')
-          xianxia_dir = Path(f"output/{today.replace('-','年')}月{today[5:7]}月{today[8:]}日/xianxia")
+          today = datetime.now(tz).strftime('%Y-%m-%d')  # "2026-05-07"
+
+          # 修正路径：today[8:10] 取两位日，"07" 而不是 "7"
+          date_chinese = today[:4] + '年' + today[5:7] + '月' + today[8:10] + '日'
+          xianxia_dir = Path(f"output/{date_chinese}/xianxia")
           report_file = xianxia_dir / f"仙侠SLG日报_{today.replace('-','')}.html"
 
+          print(f"[通知] 查找报告: {report_file}")
+
           if report_file.exists():
-            with open(report_file) as f:
-              content = f.read()
-            if '今日命中：0' in content:
-              msg = (f"**仙侠SLG热点日报 · {today}**\n\n"
-                     "今日热搜中无仙侠SLG相关热点\n\n"
-                     "来源：TrendRadar 11平台实时监控")
-            else:
-              titles = re.findall(r'class="news-title[^"]*"[^>]*>([^<]+)<', content)
-              lines = [f"{i+1}. {t.strip()}" for i, t in enumerate(titles[:5])]
-              msg = f"**仙侠SLG热点日报 · {today}**\n\n今日命中 {len(titles)} 条：\n" + "\n".join(lines)
+              with open(report_file) as f:
+                  content = f.read()
+              if '今日命中：0' in content:
+                  msg = (f"**仙侠SLG热点日报 · {today}**\n\n"
+                         "今日热搜中无仙侠SLG相关热点\n\n"
+                         "来源：TrendRadar 11平台实时监控")
+              else:
+                  titles = re.findall(r'class="news-title[^"]*"[^>]*>([^<]+)<', content)
+                  lines = [f"{i+1}. {t.strip()}" for i, t in enumerate(titles[:5])]
+                  msg = f"**仙侠SLG热点日报 · {today}**\n\n今日命中 {len(titles)} 条：\n" + "\n".join(lines)
           else:
-            msg = f"**仙侠SLG热点日报 · {today}**\n\n报告生成异常，请检查日志"
+              msg = f"**仙侠SLG热点日报 · {today}**\n\n报告生成异常，请检查日志"
 
           payload = json.dumps({"msg_type": "text", "content": {"text": msg}}).encode()
           req = urllib.request.Request(WEBHOOK, data=payload, headers={"Content-Type": "application/json"})
           urllib.request.urlopen(req, timeout=10)
           print("飞书通知已发送")
           EOF
-        env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
