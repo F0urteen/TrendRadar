@@ -1,0 +1,109 @@
+name: 仙侠SLG舆情日报
+
+on:
+  schedule:
+    # 每天 10:00 北京时间 = UTC 02:00
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # 手动触发，方便测试
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install requests pyyaml pytz
+
+      - name: 安装 TrendRadar 依赖
+        run: |
+          cd TrendRadar
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install requests pyyaml pytz
+
+      - name: 运行 TrendRadar 数据采集
+        run: |
+          cd TrendRadar
+          python main.py 2>&1
+
+      - name: 运行正文分析与报告生成
+        run: |
+          cd TrendRadar
+          python post_process.py 2>&1
+        env:
+          TZ: Asia/Shanghai
+
+      - name: 上传报告到 GitHub Pages
+        if: github.event_name == 'schedule'
+        run: |
+          cd TrendRadar/output
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "日报 $(date +'%Y-%m-%d')"
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:gh-pages 2>&1 || true
+
+      - name: 推送报告到 GitHub 仓库
+        if: github.event_name == 'schedule'
+        run: |
+          cd TrendRadar
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/$(date +'%Y年%m月%d日')/ -v 2>&1 || true
+          git diff --cached --quiet || (echo "No new output to commit" && exit 0)
+          git commit -m "日报 $(date +'%Y-%m-%d %H:%M')" || true
+          git push 2>&1 || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 发送飞书通知
+        if: always()
+        run: |
+          python3 << 'EOF'
+          import os, json
+          from pathlib import Path
+          from datetime import datetime
+
+          WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
+          if not WEBHOOK:
+            print("FEISHU_WEBHOOK 未设置，跳过推送")
+            exit(0)
+
+          import urllib.request, urllib.parse
+
+          today = datetime.now().strftime('%Y-%m-%d')
+          xianxia_dir = Path(f"TrendRadar/output/{today.replace('-','年')}月{today[5:7]}月{today[8:]}日/xianxia")
+          report_file = xianxia_dir / f"仙侠SLG日报_{today.replace('-','')}.html"
+
+          # 读取正文内容用于飞书消息
+          if report_file.exists():
+            with open(report_file) as f:
+              content = f.read()
+            if '今日命中：0' in content:
+              msg = f"**仙侠SLG热点日报 · {today}**\n\n今日热搜中无仙侠SLG相关热点\n\n来源：TrendRadar 11平台实时监控"
+            else:
+              # 提取标题列表
+              import re
+              titles = re.findall(r'class="news-title[^"]*"[^>]*>([^<]+)<', content)
+              lines = [f"{i+1}. {t.strip()}" for i, t in enumerate(titles[:5])]
+              msg = f"**仙侠SLG热点日报 · {today}**\n\n今日命中 {len(titles)} 条：\n" + "\n".join(lines)
+          else:
+            msg = f"**仙侠SLG热点日报 · {today}**\n\n报告生成异常，请检查日志"
+
+          payload = json.dumps({"msg_type": "text", "content": {"text": msg}}).encode()
+          req = urllib.request.Request(WEBHOOK, data=payload, headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req, timeout=10)
+          print("飞书通知已发送")
+          EOF
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
